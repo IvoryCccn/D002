@@ -54,8 +54,9 @@ class FMRobot(Agent):
             self.inform(msg=f"My houlding of {market.name} are {asset.units} ({asset.units_available})")
 
     def received_orders(self, orders: list[Order]) -> None:
-        for order in orders:
-            self.inform(msg=f"There is a new {new_order.order_type.name} order to {new_order.order_side.name} {new_order.units} unit(s) of {new_order.market.name} ({new_order.market.fm_id}) for ${new_order.price / 100:.2f} which is {"" if new_order.mine else "NOT "}mine")
+        for new_order in orders:
+            if not (new_order.order_type == OrderType.LIMIT and new_order.is_cancelled):
+                self.inform(msg=f"There is a new {new_order.order_type.name} order to {new_order.order_side.name} {new_order.units} unit(s) of {new_order.market.name} ({new_order.market.fm_id}) for ${new_order.price / 100:.2f} which is {"" if new_order.mine else "NOT "}mine")
 
     def order_accepted(self, order: Order) -> None:
         pass
