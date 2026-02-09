@@ -9,16 +9,17 @@ from fmclient import Agent, Market, Holding, Session, Order, OrderType, OrderSid
 # Flex-E-Market credential
 
 FM_ACCOUNT = "fain-premium"
-FM_EMAIL = "trader11@d002"
-FM_PASSWORD = "LIPNE"
-ROBOT_NAME = "My first trading robot"
+FM_EMAIL = "nc681@d002"
+FM_PASSWORD = "nc681"
+ROBOT_NAME = "robot 20260208"
 FM_MARKETPLACE_ID = 1516
 
 
 # The Base Robot Class definition
 
 class FMRobot(Agent):
-    """ A agent template that ...
+    """
+    Basic robot from Workshop 2
     """
     def __init__(self, account: str, email: str, password: str, marketplace_id: int, name: str = 'FMRobot'):
         # Initialise the parent class, Agent
@@ -27,36 +28,30 @@ class FMRobot(Agent):
         # Set the logger to DEBUG to record all events or INFO for key events.
         # logging.getLogger('agent').setLevel(logging.DEBUG)
 
-        self.description = f"This is {name} bot for {email}!"
+        self.description = f"This is {name} bot for {email} created in Workshop 2!!"
 
     def initialised(self) -> None:
-        # marketplace: fm_id, name, description
-        print(f"I am in marketplace {self.marketplace.name} ({self.marketplace.fm_id}) with desciption: {self.marketplace.description}")
-        
-        # market: fm_id, name, description, price_tick
-        for market in self.markets.values():
-            self.inform(msg=f"\tWith market {market.name} ({market.fm_id}) with description: {market.description} and tick size {market.price_tick}")
-
+        self.inform(f"{self.marketplace.name} ({self.marketplace.fm_id}); {self.marketplace.description}")
+        self.inform(f"\tI can trade in {', '.join(f"{market.name} ({market_id}){" (private)" if market.private_market else ""}" for market_id, market in self.markets.items())}")
+    
     def pre_start_tasks(self) -> None:
         pass
 
     def received_session_info(self, session: Session) -> None:
         if session.is_open:
-            self.inform(msg=f"The session is open with session id {session.fm_id}. You are able to trade.")
+            self.inform(f"Marketplace is now open for trading. The new session is {session.fm_id}")
         elif session.is_paused:
-            self.inform(msg=f"The session is currently paused. You cannot currently trade.")
+            self.inform("Marketplace is now paused. You can not trade.")
         elif session.is_closed:
-            self.inform(msg=f"The session is currently closed. Wait for a new session before you can trade.")
+            self.inform("Marketplace is now closed. You can not trade.")
 
     def received_holdings(self, holdings: Holding) -> None:
-        self.inform(msg=f"My current cash is: ${holdings.cash / 100: .2f} ({holdings.cash_initial})")
-        for market, asset in holdings.assets.items():
-            self.inform(msg=f"My houlding of {market.name} are {asset.units} ({asset.units_available})")
+        self.inform(f"Current holdings - Cash: {holdings.cash / 100:.2f} ({holdings.cash_available / 100:.2f}), {", ".join([f"{market.name}: {asset.units} ({asset.units_available})" for market, asset in holdings.assets.items()])}")
 
     def received_orders(self, orders: list[Order]) -> None:
         for new_order in orders:
             if not (new_order.order_type == OrderType.LIMIT and new_order.is_cancelled):
-                self.inform(msg=f"There is a new {new_order.order_type.name} order to {new_order.order_side.name} {new_order.units} unit(s) of {new_order.market.name} ({new_order.market.fm_id}) for ${new_order.price / 100:.2f} which is {"" if new_order.mine else "NOT "}mine")
+                self.inform(f"There is a new {new_order.order_type.name} order to {new_order.order_side.name} {new_order.units} unit(s) of {new_order.market.name} ({new_order.market.fm_id}) for ${new_order.price / 100:.2f} which is {"" if new_order.mine else "NOT "}mine")
 
     def order_accepted(self, order: Order) -> None:
         pass
@@ -68,6 +63,6 @@ class FMRobot(Agent):
 # The dunder name equals dunder main
 
 if __name__ == "__main__":
-    # Swap your robot
+    # Spawn your robot
     bot = FMRobot(account=FM_ACCOUNT, email=FM_EMAIL, password=FM_PASSWORD, marketplace_id=FM_MARKETPLACE_ID, name=ROBOT_NAME)    
     bot.run()
