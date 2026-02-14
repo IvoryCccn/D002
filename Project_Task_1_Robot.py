@@ -1,14 +1,17 @@
 from enum import Enum
+import copy
+
 from fmclient import Agent, Market, Holding, Order, OrderSide, OrderType, Session
+
 
 # Trading account details
 FM_ACCOUNT = "fain-premium"
 FM_EMAIL = "trader11@d002"
 FM_PASSWORD = "LIPNE"
 FM_MARKETPLACE_ID = 1513
+
 PUBLIC_MARKET_ID = 2681
 PRIVATE_MARKET_ID = 2682
-
 NATURE_TRADER_ID = "M000"
 
 # Enum for the roles of the bot
@@ -40,20 +43,25 @@ class IDSBot(Agent):
     _my_public_order: Order | None
 
     _waiting_for_server: bool
+    _waiting_for_public_trade: bool
+    _pending_private_order: tuple[OrderSide, int] | None
 
     def __init__(self, account: str, email: str, password: str, marketplace_id: int, bot_type: BotType, bot_name: str = "FMBot"):
         super().__init__(account, email, password, marketplace_id, name=bot_name)
         self._public_market = None
         self._private_market = None
 
-        self._role = None # store seller or buyer the robot should act
-        self._bot_type = bot_type # store bot type
-        self._holdings = None # store holding information for checking
+        self._role = None  # store seller or buyer the robot should act
+        self._bot_type = bot_type  # store bot type
 
-        self._my_private_order = None # track my private market standing order
-        self._my_public_order = None # track my public market standing order
+        self._holdings = None  # store holding information for checking
 
-        self._waiting_for_server = False # check to avoid double order sending
+        self._my_private_order = None  # track my private market standing order
+        self._my_public_order = None  # track my public market standing order
+
+        self._waiting_for_server = False  # check to avoid double order sending
+        self._waiting_for_public_trade = False  # check to avoid public market not traded but private has traded
+        self._pending_private_order = tuple | None  # store parameters that private market order requires
 
     def initialised(self):
         self._public_market = self.markets[PUBLIC_MARKET_ID]
@@ -97,10 +105,24 @@ class IDSBot(Agent):
         self.inform("\n".join(lines))
 
     def received_orders(self, orders: list[Order]) -> None:
+        """
+        This method performs four main tasks:
+            1. Track standing orders in the market
+            2. Get private market signal for robot role design
+            3. Calculate margin using standing order price
+            4. Use margin to decide order sending or wait
+        """
+
         best_private_buy: Order | None = None
         best_private_sell: Order | None = None
         best_public_buy: Order | None = None
         best_public_sell: Order | None = None
+
+        # reset my order tracking
+        self._my_private_order = None
+        self._my_public_order = None
+
+        # ----- 1) track market order information -----
 
         for order in Order.current().values():
             # solve limit order only
@@ -141,6 +163,8 @@ class IDSBot(Agent):
             f"SELL order price is [{best_public_sell.price if best_public_sell else None}]"
         )
         
+        # ----- 2) update robot role using private signal -----
+        
         # identify private market signal
         private_signal: Order | None = best_private_buy if best_private_buy is not None else best_private_sell
         margin = None
@@ -159,7 +183,8 @@ class IDSBot(Agent):
                 self._role = new_role
                 self.inform(f"Robot role updated to [{self._role.name}]")
 
-            # calculate profit margin
+            # ----- 3) calculate profit margin -----
+
             if new_role == Role.BUYER:
                 if best_public_sell is not None:
                     margin = private_signal.price - best_public_sell.price
@@ -176,64 +201,142 @@ class IDSBot(Agent):
                 margin = None
                 self.inform("cannot calculate margin due to missing best standing order price")
 
-        # placing order if it is profitable
-        if margin != None:
-            if self._waiting_for_server == False and margin > PROFIT_MARGIN:
-                self.inform(f"margin ({margin}) is bigger than target, take buying action to make profits")
-                if self._role == Role.BUYER:
-                    if self._holdings.cash_available > best_public_sell.price and self._holdings.assets[self._private_market].units_available >= 1:
-                        # best ask
-                        self._placing_order(OrderSide.BUY, self._public_market, best_public_sell.price)
-                        self._placing_order(OrderSide.SELL, self._private_market, private_signal.price)
-                    else:
-                        self.inform("insufficient available cash or unit")
-                elif self._role == Role.SELLER:
-                    if self._holdings.cash_available > private_signal.price and self._holdings.assets[self._public_market].units_available >= 1:
-                        # best bid
-                        self._placing_order(OrderSide.SELL, self._public_market, best_public_buy.price)
-                        self._placing_order(OrderSide.BUY, self._private_market, private_signal.price)
-                    else:
-                        self.inform("insufficient available cash or unit")
-            elif margin <= PROFIT_MARGIN:
-                self.inform(f"margin ({margin}) is not bigger than target, no action and wait")
+        # ----- 4) placing profitable order -----
+            
+        if margin is not None and margin >= PROFIT_MARGIN:
+            if self._waiting_for_server:
+                self.inform("Waiting for server response, skip trading")
+                return
+            
+            if self._waiting_for_public_trade:
+                self.inform("Waiting for PUBLIC order to trade, skip trading")
+                return
+            
+            if self._my_private_order is not None:
+                self.inform(F"Already have PRIVATE ORDER (fm_id={self._my_private_order.fm_id}), skip trading")
+                return
+            
+            if self._my_public_order is not None:
+                self.inform(f"Already have PUBLIC order (fm_id={self._my_public_order.fm_id}), skip trading")
+                return
+            
+            self.inform(f"margin ({margin}) is bigger than target, take buying action to make profits")
+                
+            if self._role == Role.BUYER:
+                if self._holdings.cash_available >= best_public_sell.price:
+                    # ----- best ask -----
+
+                    # sending order to public market
+                    self._placing_order(OrderSide.BUY, self._public_market, best_public_sell.price)
+                    # if order in public market is immediately traded, sending order to private market
+                    self._waiting_for_public_trade = True
+                    self._pending_private_order = (OrderSide.SELL, private_signal.price)
+                else:
+                    self.inform(f"Insufficient cash for PUBLIC BUY order (need {best_public_sell.price}, have {self._holdings.cash_available})")
+            
+            elif self._role == Role.SELLER:
+                if self._holdings.assets[self._public_market].units_available >= 1:
+                    # ----- best bid -----
+
+                    # sending order to public market
+                    self._placing_order(OrderSide.SELL, self._public_market, best_public_buy.price)
+                    # if order in public market is immediately traded, sending order to private market
+                    self._waiting_for_public_trade = True
+                    self._pending_private_order = (OrderSide.BUY, private_signal.price)
+                else:
+                    self.inform(f"Insufficient asset for PUBLIC SELL order (now {self._holdings.assets[self._public_market].units_available} unit)")
+        
+        elif margin is not None and margin < PROFIT_MARGIN:
+            self.inform(f"Margin ({margin}) is not bigger than target, no action and wait")
+        
         else:
-            margin = None
-            self.inform(f"margin is None, no action and wait")
+            self.inform("Margin is None, no action and wait")
+
+
 
     def order_accepted(self, order: Order) -> None:
         self._waiting_for_server = False
 
         self.inform(f"Order accepted in [{order.market.name}]: fm_id={order.fm_id}, side={order.order_side.name}, price={order.price}, traded={order.has_traded}")
+        
+        # ----- 1) track public market order -----
+
+        # if public market order is traded, sending private market order; else, cancelling
+        if self._waiting_for_public_trade and order.market.fm_id == PUBLIC_MARKET_ID:
+            if order.has_traded:
+                self.inform("PUBLIC market order traded immediately, now sending PRIVATE market order")
+                # send private market order
+                if self._pending_private_order is not None:
+                    side, price = self._pending_private_order
+                    # check whether cash is enough
+                    if side == OrderSide.BUY:
+                        if self._holdings.cash_available >= price:
+                            self._placing_order(side, self._private_market, price)
+                        else:
+                            self.inform(f"Insufficient cash for PRIVATE BUY order (need {price}, have {self._holdings.cash_available})")
+                    # check whether asset is enough
+                    elif side == OrderSide.SELL:
+                        if self._holdings.assets[self._private_market].units_available >= 1:
+                            self._placing_order(side, self._private_market, price)
+                        else:
+                            self.inform(f"Insufficient asset for PRIVATE SELL order (now {self._holdings.assets[self._private_market].units_available} unit)")
+            else:
+                self.inform("PUBLIC market order became standing order, cancelling public market order and private market order plan")
+                # cancel public market order
+                cancel_order = copy.copy(order)
+                cancel_order.order_type = OrderType.CANCEL
+                self.send_order(cancel_order)
+                self.inform(f"Sent cancel for PUBLIC order: {order.fm_id}")        
+            
+            # reset private market sending signal
+            self._pending_private_order = None
+            self._waiting_for_public_trade = False
+            
+            return
+
+        # ----- 2) update standing order -----
 
         # if order is not traded and not cancelled, this order is now a standing order
         if order.order_type == OrderType.LIMIT and (not order.has_traded) and (not order.is_cancelled):
-            if order.market is not None:
-                if order.market.fm_id == PUBLIC_MARKET_ID:
-                    self._my_public_order = order
-                    
-                elif order.market.fm_id == PRIVATE_MARKET_ID:
-                    self._my_private_order = order
+            if order.market.fm_id == PUBLIC_MARKET_ID:
+                self._my_public_order = order    
+            elif order.market.fm_id == PRIVATE_MARKET_ID:
+                self._my_private_order = order
+        # if order is traded or cancelled, this order is now not a standing order
         else:
-            # if order is traded or cancelled, this order is now not a standing order
             if self._my_public_order is not None and order.fm_id == self._my_public_order.fm_id:
                 self._my_public_order = None
             if self._my_private_order is not None and order.fm_id == self._my_private_order.fm_id:
                 self._my_private_order = None
+
+
 
     def order_rejected(self, info: dict[str, str], order: Order) -> None:
         self._waiting_for_server = False
 
         self.warning(f"Order rejected in [{order.market.name}]: order={order} info={info}")
 
-        # if I have a LIMIT order rejected, well it was never actually standing, so remove my standing order tracking
+        # ----- 1) track public market order -----
+
+        # if public market order is rejected, cancelling private market order
+        if self._waiting_for_public_trade and order.market.fm_id == PUBLIC_MARKET_ID:
+            self.inform("PUBLIC market order rejected, cancelling private market order plan")
+            self._pending_private_order = None
+            self._waiting_for_public_trade = False
+        
+        # ----- 2) update standing order -----
+
+        # if a LIMIT order rejected, it was never actually standing, so remove my standing order tracking
         if self._my_public_order is not None and order.ref == self._my_public_order.ref:
             self._my_public_order = None
         if self._my_private_order is not None and order.ref == self._my_private_order.ref:
             self._my_private_order = None
 
+
+
     def _placing_order(self, side: OrderSide, market: Market, price: int) -> None:
         """
-        Send a 1-unit limit order into the at the given price
+        Send a 1-unit limit order into market at the given price.
         """
         if market is None:
             self.warning("Cannot send order: PUBLIC or PRIVATE market not initialised.")
@@ -250,15 +353,11 @@ class IDSBot(Agent):
 
         new_order.owner_or_target = NATURE_TRADER_ID if market.fm_id == PRIVATE_MARKET_ID else None
 
-        if market.fm_id == PRIVATE_MARKET_ID:
-            self._my_private_order = new_order
-        elif market.fm_id == PUBLIC_MARKET_ID:
-            self._my_public_order = new_order
-
         self._waiting_for_server = True
 
         self.send_order(new_order)
         self.inform(f"Sent order in {market.name}: {new_order}")
+
 
 
 if __name__ == "__main__":
