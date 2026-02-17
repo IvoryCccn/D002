@@ -45,6 +45,7 @@ class IDSBot(Agent):
     _waiting_for_server: bool
     _waiting_for_public_trade: bool
     _pending_private_order: tuple[OrderSide, int] | None
+    _pending_public_fm_id: int | None
 
     def __init__(self, account: str, email: str, password: str, marketplace_id: int, bot_type: BotType, bot_name: str = "FMBot"):
         super().__init__(account, email, password, marketplace_id, name=bot_name)
@@ -61,7 +62,8 @@ class IDSBot(Agent):
 
         self._waiting_for_server = False  # check to avoid double order sending
         self._waiting_for_public_trade = False  # check to avoid public market not traded but private has traded
-        self._pending_private_order = tuple | None  # store parameters that private market order requires
+        self._pending_private_order = None  # store parameters that private market order requires
+        self._pending_public_fm_id = None # bind public order with private sending order plan
 
     def initialised(self):
         self._public_market = self.markets[PUBLIC_MARKET_ID]
@@ -103,6 +105,8 @@ class IDSBot(Agent):
             lines.append(f"{market.name:<20} {asset.units:>12} {asset.units_available:>12}")
 
         self.inform("\n".join(lines))
+
+
 
     def received_orders(self, orders: list[Order]) -> None:
         """
@@ -202,7 +206,14 @@ class IDSBot(Agent):
                 self.inform("cannot calculate margin due to missing best standing order price")
 
         # ----- 4) placing profitable order -----
-            
+
+        # control net units equals to zero
+        if self._holdings is not None and self._public_market is not None and self._private_market is not None:
+            net_units = self._holdings.assets[self._public_market].units + self._holdings.assets[self._private_market].units
+            if net_units != 0:
+                self.inform(f"Net units not zero (PUBLIC + PRIVATE = {net_units}), block new PUBLIC orders until hedged back to 0")
+                return
+
         if margin is not None and margin >= PROFIT_MARGIN:
             if self._waiting_for_server:
                 self.inform("Waiting for server response, skip trading")
@@ -223,6 +234,7 @@ class IDSBot(Agent):
             self.inform(f"margin ({margin}) is bigger than target, take buying action to make profits")
                 
             if self._role == Role.BUYER:
+                # check available cash is necessary
                 if self._holdings.cash_available >= best_public_sell.price:
                     # ----- best ask -----
 
@@ -231,20 +243,20 @@ class IDSBot(Agent):
                     # if order in public market is immediately traded, sending order to private market
                     self._waiting_for_public_trade = True
                     self._pending_private_order = (OrderSide.SELL, private_signal.price)
+                    self._pending_public_fm_id = None
                 else:
                     self.inform(f"Insufficient cash for PUBLIC BUY order (need {best_public_sell.price}, have {self._holdings.cash_available})")
             
             elif self._role == Role.SELLER:
-                if self._holdings.assets[self._public_market].units_available >= 1:
-                    # ----- best bid -----
+                # short selling is permitted, do not need to check available unit
+                # ----- best bid -----
 
-                    # sending order to public market
-                    self._placing_order(OrderSide.SELL, self._public_market, best_public_buy.price)
-                    # if order in public market is immediately traded, sending order to private market
-                    self._waiting_for_public_trade = True
-                    self._pending_private_order = (OrderSide.BUY, private_signal.price)
-                else:
-                    self.inform(f"Insufficient asset for PUBLIC SELL order (now {self._holdings.assets[self._public_market].units_available} unit)")
+                # sending order to public market
+                self._placing_order(OrderSide.SELL, self._public_market, best_public_buy.price)
+                # if order in public market is immediately traded, sending order to private market
+                self._waiting_for_public_trade = True
+                self._pending_private_order = (OrderSide.BUY, private_signal.price)
+                self._pending_public_fm_id = None
         
         elif margin is not None and margin < PROFIT_MARGIN:
             self.inform(f"Margin ({margin}) is not bigger than target, no action and wait")
@@ -263,23 +275,40 @@ class IDSBot(Agent):
 
         # if public market order is traded, sending private market order; else, cancelling
         if self._waiting_for_public_trade and order.market.fm_id == PUBLIC_MARKET_ID:
+            if self._pending_public_fm_id is None:
+                self._pending_public_fm_id = order.fm_id
+
             if order.has_traded:
                 self.inform("PUBLIC market order traded immediately, now sending PRIVATE market order")
+                
+                send_private = False
+
                 # send private market order
                 if self._pending_private_order is not None:
                     side, price = self._pending_private_order
+                    
                     # check whether cash is enough
                     if side == OrderSide.BUY:
                         if self._holdings.cash_available >= price:
                             self._placing_order(side, self._private_market, price)
+                            send_private = True
                         else:
                             self.inform(f"Insufficient cash for PRIVATE BUY order (need {price}, have {self._holdings.cash_available})")
-                    # check whether asset is enough
+                    
+                    # do no need to check whether asset is enough, cuz short selling is permitted
                     elif side == OrderSide.SELL:
-                        if self._holdings.assets[self._private_market].units_available >= 1:
-                            self._placing_order(side, self._private_market, price)
-                        else:
-                            self.inform(f"Insufficient asset for PRIVATE SELL order (now {self._holdings.assets[self._private_market].units_available} unit)")
+                        self._placing_order(side, self._private_market, price)
+                        send_private = True
+                
+                if send_private:                
+                    # reset private market sending signal
+                    self._pending_private_order = None
+                    self._waiting_for_public_trade = False
+                    self._pending_public_fm_id = None
+                else:
+                    # if public order traded but not hedged, keeping pending and do not open new public order
+                    self._waiting_for_public_trade = False
+            
             else:
                 self.inform("PUBLIC market order became standing order, cancelling public market order and private market order plan")
                 # cancel public market order
@@ -287,14 +316,46 @@ class IDSBot(Agent):
                 cancel_order.order_type = OrderType.CANCEL
                 self.send_order(cancel_order)
                 self.inform(f"Sent cancel for PUBLIC order: {order.fm_id}")        
-            
-            # reset private market sending signal
-            self._pending_private_order = None
-            self._waiting_for_public_trade = False
-            
-            return
+                
+                # do not reset private market sending signal, keep waiting in case order trades before cancel completes
+                self._waiting_for_public_trade = True
 
-        # ----- 2) update standing order -----
+        # ----- 2) handle delayed trade of PUBLIC order -----
+        if (
+            order.market.fm_id == PUBLIC_MARKET_ID 
+            and order.has_traded 
+            and order.mine 
+            and self._pending_private_order is not None
+            and self._pending_public_fm_id is not None 
+            and order.fm_id == self._pending_public_fm_id
+        ):
+            self.inform(f"PUBLIC market standing order fm_id={order.fm_id} traded (delayed), now sending PRIVATE market order to hedge")
+
+            side, price = self._pending_private_order
+
+            send_private = False
+
+            # send private market order
+            if side == OrderSide.BUY:
+                if self._holdings.cash_available >= price:
+                    self._placing_order(side, self._private_market, price)
+                    send_private = True
+                else:
+                    self.inform(f"Insufficient cash for PRIVATE BUY order (need {price}, have {self._holdings.cash_available})")
+
+            elif side == OrderSide.SELL:
+                self._placing_order(side, self._private_market, price)
+                send_private = True
+            
+            if send_private:                
+                # reset flags after handling delayed trade
+                self._pending_private_order = None
+                self._waiting_for_public_trade = False
+                self._pending_public_fm_id = None
+            else:
+                self._waiting_for_public_trade = False
+
+        # ----- 3) update standing order -----
 
         # if order is not traded and not cancelled, this order is now a standing order
         if order.order_type == OrderType.LIMIT and (not order.has_traded) and (not order.is_cancelled):
@@ -308,6 +369,16 @@ class IDSBot(Agent):
                 self._my_public_order = None
             if self._my_private_order is not None and order.fm_id == self._my_private_order.fm_id:
                 self._my_private_order = None
+            
+            # only clear pending if it is the bound pending public order
+            if order.market.fm_id == PUBLIC_MARKET_ID and order.is_cancelled:
+                if self._pending_public_fm_id is not None and order.fm_id == self._pending_public_fm_id:
+                    self.inform("PUBLIC market order cancelled confirmed, reset waiting state")
+                    self._pending_private_order = None
+                    self._waiting_for_public_trade = False
+                    self._pending_public_fm_id = None
+                else:
+                    self.inform("PUBLIC cancel confirmed (not pending hedge order), keep pending state unchanged")
 
 
 
@@ -320,9 +391,12 @@ class IDSBot(Agent):
 
         # if public market order is rejected, cancelling private market order
         if self._waiting_for_public_trade and order.market.fm_id == PUBLIC_MARKET_ID:
-            self.inform("PUBLIC market order rejected, cancelling private market order plan")
-            self._pending_private_order = None
-            self._waiting_for_public_trade = False
+            if order.order_type == OrderType.CANCEL:
+                self.inform("PUBLIC market CANCEL order rejected, keeping waiting state")
+            else:
+                self.inform("PUBLIC market order rejected, cancelling private market order plan")
+                self._pending_private_order = None
+                self._waiting_for_public_trade = False
         
         # ----- 2) update standing order -----
 
