@@ -6,13 +6,13 @@ from fmclient import Agent, Market, Holding, Order, OrderSide, OrderType, Sessio
 
 # Trading account details
 FM_ACCOUNT = "fain-premium"
-FM_EMAIL = "trader11@d002"
-FM_PASSWORD = "LIPNE"
+FM_EMAIL = "nc681@d002"
+FM_PASSWORD = "nc681"
 FM_MARKETPLACE_ID = 1513
 
 PUBLIC_MARKET_ID = 2681
 PRIVATE_MARKET_ID = 2682
-NATURE_TRADER_ID = "MOOO"
+NATURE_TRADER_ID = "M000"
 
 # Enum for the roles of the bot
 class Role(Enum):
@@ -47,7 +47,6 @@ class IDSBot(Agent):
     _waiting_for_private_trade: bool
     _pending_private_order: tuple[OrderSide, int] | None
     _pending_public_fm_id: int | None
-    _pending_private_fm_id: int | None
 
     def __init__(self, account: str, email: str, password: str, marketplace_id: int, bot_type: BotType, bot_name: str = "FMBot"):
         super().__init__(account, email, password, marketplace_id, name=bot_name)
@@ -67,7 +66,6 @@ class IDSBot(Agent):
         self._waiting_for_private_trade = False  # check whether private order is traded
         self._pending_private_order = None  # store parameters that private market order requires
         self._pending_public_fm_id = None  # bind pending hedge plan in private market with a specific public order
-        self._pending_private_fm_id = None  # bind a corresponding private order which aims to hedge public order
 
     def initialised(self):
         self._public_market = self.markets[PUBLIC_MARKET_ID]
@@ -270,23 +268,21 @@ class IDSBot(Agent):
 
         self.inform(f"Order accepted in [{order.market.name}]: fm_id={order.fm_id}, side={order.order_side.name}, price={order.price}, traded={order.has_traded}")
         
-        if order.market.fm_id == PRIVATE_MARKET_ID and order.mine and self._waiting_for_private_trade:
-            # bind private order's fm_id which is used to hedge public order
-            if self._pending_private_fm_id is None:
-                self._pending_private_fm_id = order.fm_id
-            
+        if order.market.fm_id == PRIVATE_MARKET_ID and order.mine and self._waiting_for_private_trade:            
             # hedge is complete only when private actually traded, when finished, reset all the signal
             if order.has_traded:
                 self.inform("PRIVATE hedge order is traded (hedge completed), clearing pending states")
                 self._pending_private_order = None
                 self._pending_public_fm_id = None
-                self._pending_private_fm_id = None
                 self._waiting_for_private_trade = False
 
         # ----- 1) track public market order -----
 
         # if public market order is traded, sending private market order; else, cancelling
-        if self._waiting_for_public_trade and order.market.fm_id == PUBLIC_MARKET_ID:
+        if (self._waiting_for_public_trade 
+            and order.market.fm_id == PUBLIC_MARKET_ID 
+            and order.order_type == OrderType.LIMIT 
+            and order.mine):
             # bind the public order which need to be hedged
             if self._pending_public_fm_id is None:
                 self._pending_public_fm_id = order.fm_id
@@ -318,7 +314,6 @@ class IDSBot(Agent):
                 if send_private:                
                     # reset private market sending signal
                     self._waiting_for_private_trade = True
-                    self._pending_private_fm_id = None
                 else:
                     # if public order traded but not hedged, keep pending and wait for hedging
                     self._waiting_for_private_trade = False
@@ -368,7 +363,6 @@ class IDSBot(Agent):
             if send_private:                
                 # reset flags after handling delayed trade
                 self._waiting_for_private_trade = True
-                self._pending_private_fm_id = None
             else:
                 self._waiting_for_private_trade = False
 
