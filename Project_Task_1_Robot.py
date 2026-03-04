@@ -209,13 +209,6 @@ class IDSBot(Agent):
 
         # ----- 4) placing profitable order -----
 
-        # control net units equals to zero
-        # if self._holdings is not None and self._public_market is not None and self._private_market is not None:
-        #     net_units = self._holdings.assets[self._public_market].units + self._holdings.assets[self._private_market].units
-        #     if net_units != 0:
-        #         self.inform(f"Net units not zero (PUBLIC + PRIVATE = {net_units}), block new PUBLIC orders until hedged back to 0")
-        #         return
-
         if margin is not None and margin >= PROFIT_MARGIN:
             if self._waiting_for_server:
                 self.inform("Waiting for server response, skip trading")
