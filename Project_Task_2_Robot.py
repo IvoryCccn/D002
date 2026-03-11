@@ -28,8 +28,17 @@ class CAPMBot(Agent):
     _holdings: Holding | None
     _orderbook: dict[int, OrderBookEntry]
     _my_standing_orders: dict[int, Order]
-    _robot_type: BotType | None
+    _current_performance: float | None
     _pending_order: bool
+
+    # Cached snapshots for change-detection logging
+    _last_logged_performance: float | None
+    _last_logged_holdings_snapshot: dict | None
+    _last_logged_standing_orders_snapshot: dict | None
+    _last_logged_marginal_values: dict | None
+
+    # Cash shortage plan: queued sells + the buy that triggered the shortage
+    _cash_shortage_plan: dict | None
 
     def __init__(self, account: str, email: str, password: str, marketplace_id: int, risk_penalty: float, bot_name: str = "CAPMBot"):
         super().__init__(account, email, password, marketplace_id, name=bot_name)
@@ -39,8 +48,15 @@ class CAPMBot(Agent):
         self._holdings = None
         self._orderbook = {}
         self._my_standing_orders = {}
-        self._robot_type = None
+        self._current_performance = None
         self._pending_order = False
+
+        self._last_logged_performance = None
+        self._last_logged_holdings_snapshot = None
+        self._last_logged_standing_orders_snapshot = None
+        self._last_logged_marginal_values = {}
+
+        self._cash_shortage_plan = None
 
     def initialised(self):
         """
@@ -52,6 +68,44 @@ class CAPMBot(Agent):
             self._payoffs[asset_id] = [int(payoff) for payoff in description.split(",")]
 
         self.inform("Bot initialised, I have the payoffs for the states.")
+
+    def _make_order(self, market: Market, order_side: OrderSide, price: int, units: int = 1) -> Order:
+        """Create a LIMIT order without sending it."""
+        order = Order.create_new(market)
+        order.order_type = OrderType.LIMIT
+        order.order_side = order_side
+        order.price = price
+        order.units = units
+        order.mine = True
+        return order
+    
+    def _cancel_order(self, order: Order):
+        """Cancel an existing standing order by referencing it directly."""
+        cancel = Order.create_new(order.market)
+        cancel.order_type = OrderType.CANCEL
+        cancel.order_side = order.order_side
+        cancel.price = order.price
+        cancel.units = order.units
+        cancel.mine = True
+        cancel.fm_id = order.fm_id
+        self.send_order(cancel)
+    
+    def _submit_order(self, order: Order) -> bool:
+        """
+        Send an order if no other order is currently pending.
+        Records the order in _my_standing_orders on success.
+
+        :param order: Order to send.
+        :return: True if submitted, False if blocked by a pending order.
+        """
+        if self._pending_order:
+            self.inform("Waiting for pending order, skip.")
+            return False
+        self._pending_order = True
+        self.send_order(order)
+        # Record this order to prevent information delay and duplicated order
+        self._my_standing_orders[order.market.fm_id] = order
+        return True
 
     def get_potential_performance(self, orders: list[Order]) -> float:
         """
@@ -93,14 +147,33 @@ class CAPMBot(Agent):
 
         performance = expected_payoff - self._risk_penalty * variance
 
-        self.inform(
-            f"\nPotential performance: "
-            f"\nExpected payoff = {expected_payoff:.4f}, "
-            f"\nVariance = {variance:.4f}, "
-            f"\nPerformance = {performance:.4f}"
-        )
-
         return performance
+
+    def _log_performance_if_changed(self):
+        """
+        Print performance + current holdings only when performance has changed
+        since the last time it was logged. This avoids flooding the log with
+        identical lines on every orderbook tick.
+        """
+        self._current_performance = self.get_potential_performance([])
+        if self._current_performance == self._last_logged_performance:
+            return
+
+        self._last_logged_performance = self._current_performance
+
+        # Build holdings snapshot string
+        lines = [f"\n--- Performance changed: {self._current_performance:.4f} ---"]
+        lines.append(f"{'Account':<12} {'Total':>10} {'Available':>12}")
+        lines.append("-" * 38)
+        lines.append(
+            f"{'Cash':<12} "
+            f"{self._holdings.cash / 100:>10.2f} "
+            f"{self._holdings.cash_available / 100:>12.2f}"
+        )
+        for market, asset in self._holdings.assets.items():
+            lines.append(f"{market.name:<12} {asset.units:>10} {asset.units_available:>12}")
+
+        self.inform("\n".join(lines))
 
     def is_portfolio_optimal(self) -> bool:
         """
@@ -112,7 +185,6 @@ class CAPMBot(Agent):
 
         :return: True if portfolio is optimal, False otherwise.
         """
-
         current_performance = self.get_potential_performance([])
 
         for market in self.markets.values():
@@ -125,12 +197,7 @@ class CAPMBot(Agent):
             # Check buy at best ask
             ask = entry["ask"]
             if ask is not None:
-                buy_order = Order.create_new(market)
-                buy_order.market = market
-                buy_order.order_type = OrderType.LIMIT
-                buy_order.order_side = OrderSide.BUY
-                buy_order.price = ask
-                buy_order.units = 1
+                buy_order = self._make_order(market, OrderSide.BUY, ask)
                 if self.get_potential_performance([buy_order]) > current_performance:
                     self.inform(
                         f"Portfolio now not optimal: BUY 1 unit of {market.name} "
@@ -141,13 +208,7 @@ class CAPMBot(Agent):
             # Check sell at best bid
             bid = entry["bid"]
             if bid is not None:
-                sell_order = Order.create_new(market)
-                sell_order.market = market
-                sell_order.order_type = OrderType.LIMIT
-                sell_order.order_side = OrderSide.SELL
-                sell_order.price = bid
-                sell_order.units = 1
-                sell_order.mine = True
+                sell_order = self._make_order(market, OrderSide.SELL, bid)
                 if self.get_potential_performance([sell_order]) > current_performance:
                     self.inform(
                         f"Portfolio now not optimal: SELL 1 unit of {market.name} "
@@ -172,13 +233,29 @@ class CAPMBot(Agent):
     def received_holdings(self, holdings: Holding):
         self._holdings = holdings
 
-        lines = [f"\nCurrent holdings in my account:\n"]
-        lines.append(f"{'Account':<12} {'Total':>12} {'Available':>12}")
-        lines.append("-" * 40)
-        lines.append(f"{'Cash':<12} {holdings.cash / 100:>12.2f} {holdings.cash_available / 100:>12.2f}")
+        # Build a comparable snapshot to detect real changes
+        snapshot = {
+            "cash": holdings.cash,
+            "assets": {mkt.fm_id: asset.units for mkt, asset in holdings.assets.items()}
+        }
 
+        # Nothing changed, skip printing
+        if snapshot == self._last_logged_holdings_snapshot:
+            return
+
+        # Holdings changed, continue printing
+        self._last_logged_holdings_snapshot = snapshot
+
+        lines = [f"\n[Changed] Current Holdings:"]
+        lines.append(f"{'Account':<12} {'Total':>10} {'Available':>12}")
+        lines.append("-" * 38)
+        lines.append(
+            f"{'Cash':<12} "
+            f"{holdings.cash / 100:>10.2f} "
+            f"{holdings.cash_available / 100:>12.2f}"
+        )
         for market, asset in holdings.assets.items():
-            lines.append(f"{market.name:<12} {asset.units:>12} {asset.units_available:>12}")
+            lines.append(f"{market.name:<12} {asset.units:>10} {asset.units_available:>12}")
 
         self.inform("\n".join(lines))
 
@@ -202,57 +279,45 @@ class CAPMBot(Agent):
         """
         Update self._orderbook from scratch using all current non-own LIMIT orders.
         """
-        self._orderbook = {}
+        # ----- Collect -----
+        new_orderbook: dict[int, OrderBookEntry] = {}
 
-        # Collect
         for order in Order.current().values():
-            if order.order_type is not OrderType.LIMIT:
-                continue
-            if order.mine:
+            if order.order_type is not OrderType.LIMIT or order.mine:
                 continue
 
             market_id = order.market.fm_id
+            if market_id not in new_orderbook:
+                new_orderbook[market_id] = {"name": order.market.name, "bid": None, "ask": None}
 
-            if market_id not in self._orderbook:
-                self._orderbook[market_id] = {
-                    "name": order.market.name,
-                    "bid": None,
-                    "ask": None,
-                }
-
-            entry = self._orderbook[market_id]
-
+            entry = new_orderbook[market_id]
             # Update best bid
             if order.order_side == OrderSide.BUY:
                 if entry["bid"] is None or order.price > entry["bid"]:
                     entry["bid"] = order.price
-
             # Update best ask
             elif order.order_side == OrderSide.SELL:
                 if entry["ask"] is None or order.price < entry["ask"]:
                     entry["ask"] = order.price
 
-        # Print
-        lines = ["\nCurrent best standing order:\n"]
+        # ----- Print -----
+        # Nothing change, skip printing
+        if new_orderbook == self._orderbook:
+            return
+
+        # Standing order changed, continue printing
+        self._orderbook = new_orderbook
+
+        lines = ["\n[Changed] Current best standing order:"]
         lines.append(f"{'market_id':<16} {'market_name':<12} {'bid':>8} {'ask':>12}")
         lines.append("-" * 54)
-
         for market_id in sorted(self._orderbook.keys()):
             entry = self._orderbook[market_id]
-
             bid = f"{entry['bid'] / 100:.2f}" if entry["bid"] is not None else "-"
             ask = f"{entry['ask'] / 100:.2f}" if entry["ask"] is not None else "-"
-
-            lines.append(
-                f"{market_id:<16} "
-                f"{entry['name']:<12} "
-                f"{bid:>8} "
-                f"{ask:>12}"
-            )
-
+            lines.append(f"{market_id:<16} {entry['name']:<12} {bid:>8} {ask:>12}")
         if not self._orderbook:
             lines.append("No standing market orders.")
-
         self.inform("\n".join(lines))
 
     def _update_my_standing_orders(self):
@@ -274,32 +339,40 @@ class CAPMBot(Agent):
                 self.inform(f"Standing order for market {market_id} is no longer live — removing from tracking.")
                 del self._my_standing_orders[market_id]
 
-        # Add / update any orders that appeared
+        # Add/update any orders that appeared
         for market_id, order in live_orders.items():
             self._my_standing_orders[market_id] = order
         
         # ----- Print -----
-        lines = [f"\nMy standing orders:\n"]
+        # Build snapshot for change detection
+        snapshot = {
+            mid: (o.order_side.name, o.price)
+            for mid, o in self._my_standing_orders.items()
+        }
+
+        # Nothing change, skip printing
+        if snapshot == self._last_logged_standing_orders_snapshot:
+            return
+
+        # My standing order changed, continue printing
+        self._last_logged_standing_orders_snapshot = snapshot
+
+        lines = ["\n[Changed] My standing orders:"]
         lines.append(f"{'market_id':<16} {'market_name':<16} {'side':<4} {'price':>12}")
         lines.append("-" * 54)
-
         for market_id, order in sorted(self._my_standing_orders.items()):
             lines.append(
-                f"{market_id:<16} "
-                f"{order.market.name:<16} "
-                f"{order.order_side.name:<4} "
-                f"{order.price / 100:>12.2f}"
+                f"{market_id:<16} {order.market.name:<16} "
+                f"{order.order_side.name:<4} {order.price / 100:>12.2f}"
             )
-
         if not self._my_standing_orders:
             lines.append("No standing LIMIT orders.")
-
         self.inform("\n".join(lines))
 
     def _cancel_unprofitable_standing_orders(self):
         """
-        Reviews all active standing orders and cancels any that no longer improve performance,
-        handling cases where market conditions have changed since the order was placed.
+        Reviews all active standing orders and cancel any standing orders 
+        that no longer improve performance.
         """
         current_performance = self.get_potential_performance([])
 
@@ -311,16 +384,9 @@ class CAPMBot(Agent):
                     f"{standing.order_side.name} "
                     f"at price {standing.price / 100:.2f}"
                 )
-                cancel_order = Order.create_new(standing.market)
-                cancel_order.fm_id = standing.fm_id
-                cancel_order.order_type = OrderType.CANCEL
-                cancel_order.order_side = standing.order_side
-                cancel_order.price = standing.price
-                cancel_order.units = standing.units
-                cancel_order.mine = True
-
-                self.send_order(cancel_order)
-    
+                cancel_order = self._cancel_order(standing)
+        return
+            
     def _execute_trading_strategy(self):
         """
         Switch robot type based on portfolio performance.
@@ -328,7 +394,8 @@ class CAPMBot(Agent):
             - REACTIVE → standing orders exist, portfolio not optimal, take profitable orders.
             - ACTIVE   → standing orders exist, portfolio is optimal, post limit orders.
         """
-        current_performance = self.get_potential_performance([])
+        self._log_performance_if_changed()
+        current_performance = self._current_performance
         
         # ----- 1) Reactivate model: market has not any standing order -----
         has_market_orders = any(
@@ -338,19 +405,11 @@ class CAPMBot(Agent):
         if not has_market_orders:
             self.inform("No standing orders in market. Robot is [DEACTIVE].")
             for market_id, my_order in list(self._my_standing_orders.items()):
-                cancel_order = Order.create_new(my_order.market)
-                cancel_order.fm_id = my_order.fm_id
-                cancel_order.order_type = OrderType.CANCEL
-                cancel_order.order_side = my_order.order_side
-                cancel_order.price = my_order.price
-                cancel_order.units = my_order.units
-                cancel_order.mine = True
-                self.send_order(cancel_order)
-                return
+                cancel_order = self._cancel_order(my_order)
+            return
         
         # ----- 2) Reactivate model: market has standing order & portfolio not optimal -----
         if not self.is_portfolio_optimal():
-            self._robot_type = BotType.REACTIVE
             self.inform("Robot type switch to [REACTIVE]")
 
             for market in self.markets.values():
@@ -367,69 +426,36 @@ class CAPMBot(Agent):
                 # Send buy order at best ask
                 ask = entry["ask"]
                 if ask is not None:
-
-                    if self._holdings.cash_available < ask:
-                        self.inform(f"Insufficient cash: need {ask} have {self._holdings.cash_available}")
-                        if self._handle_cash_shortage(ask, current_performance):
-                            return
-                    else:
-                        buy_order = Order.create_new(market)
-                        buy_order.order_type = OrderType.LIMIT
-                        buy_order.order_side = OrderSide.BUY
-                        buy_order.price = ask
-                        buy_order.units = 1
-                        buy_order.mine = True
-
-                        if self.get_potential_performance([buy_order]) > current_performance:
-                            if self._pending_order:
-                                self.inform("Waiting for pending order, skip")
-                            else:
-                                self.inform(f"REACTIVE BUY on {market.name} at price {ask / 100:.2f}")
-                                self._pending_order = True
-                                self.send_order(buy_order)
-                                # Record this order to prevent information delay and duplicated order
-                                self._my_standing_orders[market_id] = buy_order
+                    buy_order = self._make_order(market, OrderSide.BUY, ask)
+                    if self.get_potential_performance([buy_order]) > current_performance:
+                        if self._holdings.cash_available < ask:
+                            self.inform(f"Insufficient cash: need {ask/100:.2f} have {self._holdings.cash_available/100:.2f}")
+                            if self._handle_cash_shortage(ask, current_performance):
+                                return
+                        else:
+                            self.inform(f"REACTIVE BUY on {market.name} at {ask / 100:.2f}")
+                            if self._submit_order(buy_order):
                                 return
 
                 # Send sell order at best bid
                 bid = entry["bid"]
                 if bid is not None:
-
                     asset = self._holdings.assets.get(market)
                     if asset is None:
                         self.inform(f"[SELL blocked] {market.name}: No asset position found.")
-
                     elif not asset.can_sell:
                         self.inform(f"[SELL blocked] {market.name}: Asset cannot be sold.")
-
                     elif asset.units_available < 1:
-                        self.inform(
-                            f"[SELL blocked] {market.name}: "
-                            f"Insufficient available units (available={asset.units_available})."
-                        )
-
+                        self.inform(f"[SELL blocked] {market.name}: No available units (available={asset.units_available}).")
                     else:
-                        sell_order = Order.create_new(market)
-                        sell_order.order_type = OrderType.LIMIT
-                        sell_order.order_side = OrderSide.SELL
-                        sell_order.price = bid
-                        sell_order.units = 1
-                        sell_order.mine = True
-
+                        sell_order = self._make_order(market, OrderSide.SELL, bid)
                         if self.get_potential_performance([sell_order]) > current_performance:
-                            if self._pending_order:
-                                self.inform("Waiting for pending order, skip")
-                            else:
-                                self.inform(f"REACTIVE SELL on {market.name} at price {bid / 100:.2f}")
-                                self._pending_order = True
-                                self.send_order(sell_order)
-                                # Record this order to prevent information delay and duplicated order
-                                self._my_standing_orders[market_id] = sell_order
+                            self.inform(f"REACTIVE SELL on {market.name} at price {bid / 100:.2f}")
+                            if self._submit_order(sell_order):
                                 return
         
         #  ----- 3) Activate robot: market has standing order & portfolio optimal -----
         else:
-            self._robot_type = BotType.ACTIVE
             self.inform("Robot type switch to [ACTIVE]")
 
             for market in self.markets.values():
@@ -447,23 +473,14 @@ class CAPMBot(Agent):
                 # Only consider SELL order when margin_value is negative 
                 # Negative margin_value means too much asset so BUY order is meaningless
                 if margin_value <= 0:
-                    margin_price = market.min_price
                     if entry.get("ask") is None:
-                        sell_price = market.min_price
                         asset = self._holdings.assets.get(market)
                         if asset and asset.can_sell and asset.units_available >= 1:
-                            candidate = Order.create_new(market)
-                            candidate.order_type = OrderType.LIMIT
-                            candidate.order_side = OrderSide.SELL
-                            candidate.price = sell_price
-                            candidate.units = 1
-                            candidate.mine = True
+                            candidate = self._make_order(market, OrderSide.SELL, market.min_price)
                             if self.get_potential_performance([candidate]) >= current_performance:
-                                self.inform(f"ACTIVE SELL (neg margin value) on {market.name} at {sell_price/100:.2f}")
-                                self._pending_order = True
-                                self.send_order(candidate)
-                                self._my_standing_orders[market_id] = candidate
-                                return
+                                self.inform(f"ACTIVE SELL (neg margin) on {market.name} at {sell_price/100:.2f}")
+                                if self._submit_order(candidate):
+                                    return
                     continue
 
                 # ----- Normal Case -----
@@ -473,60 +490,38 @@ class CAPMBot(Agent):
                 # Send buy order just below indifference price
                 if entry.get("bid") is None:
                     buy_price = int(max(market.min_price, margin_price - market.price_tick))
-                    if self._holdings.cash_available < buy_price:
-                        self.inform(f"Insufficient cash: need {buy_price} have {self._holdings.cash_available}")
-                        if self._handle_cash_shortage(buy_price, current_performance):
-                            return
-                    else:
-                        candidate = Order.create_new(market)
-                        candidate.order_type = OrderType.LIMIT
-                        candidate.order_side = OrderSide.BUY
-                        candidate.price = buy_price
-                        candidate.units = 1
-                        candidate.mine = True
-
-                        if self.get_potential_performance([candidate]) > current_performance:
+                    buy_order = self._make_order(market, OrderSide.BUY, buy_price)
+                    if self.get_potential_performance([buy_order]) > current_performance:
+                        if self._holdings.cash_available < buy_price:
+                            self.inform(f"Insufficient cash: need {buy_price} have {self._holdings.cash_available}")
+                            if self._handle_cash_shortage(buy_price, current_performance):
+                                return
+                        else:
                             self.inform(f"ACTIVE BUY limit on {market.name} at price {buy_price / 100:.2f}")
-                            self._pending_order = True
-                            self.send_order(candidate)
-                            self._my_standing_orders[market_id] = candidate
-                            return
+                            if self._submit_order(buy_order):
+                                return
                 
                 # Send sell order just above indifferent price
                 if entry.get("ask") is None and market_id not in self._my_standing_orders:
                     sell_price = int(min(market.max_price, margin_price + market.price_tick))
                     asset = self._holdings.assets.get(market)
-
                     if asset is None:
                         self.inform(f"[SELL blocked] {market.name}: No asset position found.")
-
                     elif not asset.can_sell:
                         self.inform(f"[SELL blocked] {market.name}: Asset cannot be sold.")
-
                     elif asset.units_available < 1:
-                        self.inform(
-                            f"[SELL blocked] {market.name}: "
-                            f"Insufficient available units (available={asset.units_available})."
-                        )
-
+                        self.inform(f"[SELL blocked] {market.name}: No available units (available={asset.units_available}).")
                     else:
-                        candidate = Order.create_new(market)
-                        candidate.order_type = OrderType.LIMIT
-                        candidate.order_side = OrderSide.SELL
-                        candidate.price = sell_price
-                        candidate.units = 1
-                        candidate.mine = True
-
+                        candidate = self._make_order(market, OrderSide.SELL, sell_price)
                         if self.get_potential_performance([candidate]) > current_performance:
                             self.inform(f"ACTIVE SELL limit on {market.name} at price {sell_price / 100:.2f}")
-                            self._pending_order = True
-                            self.send_order(candidate)
-                            self._my_standing_orders[market_id] = candidate
-                            return
+                            if self._submit_order(candidate):
+                                return
 
     def _compute_marginal_value(self, market: Market) -> float:
         """
-        Return the marginal value (indifference price) of asset in cents.
+        Return the indifference price (cents) of buying 1 more unit of this asset.
+        Only logs when the value has changed since last computation for this market.
 
         Definition: marginal valus is the price X (cents) at which buying 
         1 extra unit of this asset leaves portfolio performance exactly unchanged.
@@ -540,7 +535,7 @@ class CAPMBot(Agent):
         :param market: the Market whose asset's marginal value we want.
         :return: marginal value in cents (float).
         """
-
+        # ----- Calculate -----
         # E[asset]
         asset_payoffs = [p / 100.0 for p in self._payoffs[market.fm_id]]
         E_asset = sum(asset_payoffs) / 4
@@ -569,7 +564,22 @@ class CAPMBot(Agent):
         # margin value（cents）
         margin_value = (E_asset - self._risk_penalty * delta_var) * 100
 
-        self.inform(f"[{market.name}]: Marginal value={margin_value / 100:.2f}")
+        # ----- Print -----
+        # Only log when value has changed
+        previous = self._last_logged_marginal_values.get(market.fm_id)
+        if previous == margin_value:
+            return margin_value
+        
+        self._last_logged_marginal_values[market.fm_id] = margin_value
+        
+        lines = ["\n[Changed] Marginal values:"]
+        lines.append(f"{'market_id':<16} {'market_name':<16} {'marginal_value':>14}")
+        lines.append("-" * 48)
+        for mkt_id, val in sorted(self._last_logged_marginal_values.items()):
+            mkt_name = next((m.name for m in self.markets.values() if m.fm_id == mkt_id), str(mkt_id))
+            marker = " *" if mkt_id == market.fm_id else ""
+            lines.append(f"{mkt_id:<16} {mkt_name:<16} {val / 100:>14.2f}{marker}")
+        self.inform("\n".join(lines))
 
         return margin_value
 
@@ -578,7 +588,7 @@ class CAPMBot(Agent):
         Attempt to raise cash by selling held assets when funds are insufficient.
 
         :param needed_cash: Amount of cash to raise (in cents).
-        :param current_performance: Current portfolio performance, used as the baseline for sell decisions.
+        :param current_performance: Current poyrtfolio performance, used as the baseline for sell decisions.
         :return: True if a sell order was successfully submitted, False if no viable candidate was found.
         """
         self.inform(f"[Cash Shortage] Trying to raise {needed_cash/100:.2f} cash. Available: {self._holdings.cash_available/100:.2f}")
@@ -610,26 +620,15 @@ class CAPMBot(Agent):
                     continue
                 margin_price = int(round(margin_value / mkt.price_tick)) * mkt.price_tick
                 price = int(max(mkt.min_price, margin_price - mkt.price_tick))
-
-            sell_order = Order.create_new(mkt)
-            sell_order.order_type = OrderType.LIMIT
-            sell_order.order_side = OrderSide.SELL
-            sell_order.price = price
-            sell_order.units = 1
-            sell_order.mine = True
-
-            perf = self.get_potential_performance([sell_order])
-            if perf > best_sell_performance:
-                best_sell_performance = perf
+            sell_order = self._make_order(mkt, OrderSide.SELL, price)
+            if self.get_potential_performance([sell_order]) > best_sell_performance:
+                best_sell_performance = self.get_potential_performance([sell_order])
                 best_sell_candidate = (mkt, sell_order, price)
 
         if best_sell_candidate is not None:
             mkt, sell_order, price = best_sell_candidate
             self.inform(f"[Cash Shortage] SELL {mkt.name} at {price/100:.2f} to raise cash.")
-            if not self._pending_order:
-                self._pending_order = True
-                self.send_order(sell_order)
-                self._my_standing_orders[mkt.fm_id] = sell_order
+            if self._submit_order(sell_order):
                 return True
 
         self.inform("[Cash Shortage] No viable strategy found to raise cash. Skipping trade.")
