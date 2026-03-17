@@ -109,23 +109,6 @@ class CAPMBot(Agent):
         if market_id in self._my_standing_orders:
             del self._my_standing_orders[market_id]
 
-    def _sell_blocked_check(self, market: Market):
-        asset = self._holdings.assets.get(market)
-
-        if asset is None:
-            self.inform(f"[SELL blocked] {market.name}: No asset position found.")
-            return True
-
-        if not asset.can_sell:
-            self.inform(f"[SELL blocked] {market.name}: Asset cannot be sold.")
-            return True
-
-        if asset.units_available < 1:
-            self.inform(f"[SELL blocked] {market.name}: No available units (available={asset.units_available}).")
-            return True
-
-        return False
-
 
 
     # ---------- Performance and valuation ----------
@@ -574,6 +557,9 @@ class CAPMBot(Agent):
                                        current_performance, reactive=True):
                 return
 
+            if self._pending_order:
+                continue
+
             bid = entry["bid"]
             if bid and self._try_trade(market, OrderSide.SELL, bid, 
                                        current_performance, reactive=True):
@@ -615,6 +601,18 @@ class CAPMBot(Agent):
             if margin_value <= 0:
                 self.inform(f"{market.name} has negative marginal value {margin_value/100:.2f}. Only consider selling.")
                 sell_price_neg = max(market.min_price, margin_price)
+
+                existing_buy = self._my_standing_orders.get(market_id, {}).get(OrderSide.BUY.name)
+                if existing_buy is not None:
+                    self.inform(
+                        f"[ACTIVE] Cancelling stale BUY in {market.name} at "
+                        f"{existing_buy.price/100:.2f} (marginal value now ≤ 0)."
+                    )
+                    self._cancel_order(existing_buy)
+                    del self._my_standing_orders[market_id][OrderSide.BUY.name]
+                    if not self._my_standing_orders.get(market_id):
+                        self._my_standing_orders.pop(market_id, None)
+
                 existing_sell_neg = self._my_standing_orders.get(market_id, {}).get(OrderSide.SELL.name)
                 if existing_sell_neg is not None:
                     if existing_sell_neg.price == sell_price_neg:
@@ -639,11 +637,14 @@ class CAPMBot(Agent):
 
             # ----- Special case: Market price already better than marginal value -----
             if ask is not None and ask <= margin_value:
-                if self._try_trade( market, OrderSide.BUY, ask, current_performance):
+                if self._try_trade( market, OrderSide.BUY, ask, current_performance, reactive=True):
                     return
+                
+            if self._pending_order:
+                continue
 
             if bid is not None and bid >= margin_value:
-                if self._try_trade( market, OrderSide.SELL, bid, current_performance):
+                if self._try_trade( market, OrderSide.SELL, bid, current_performance, reactive=True):
                     return
 
             # ----- Normal case -----
@@ -673,7 +674,23 @@ class CAPMBot(Agent):
 
                 if self._try_trade(market, OrderSide.BUY, buy_price, current_performance):
                     return
-
+                
+            else:
+                # Ask exists but not profitable, cancel any stale BUY standing order
+                existing_buy = self._my_standing_orders.get(market_id, {}).get(OrderSide.BUY.name)
+                if existing_buy is not None:
+                    self.inform(
+                        f"[ACTIVE] Cancelling stale BUY in {market.name} at "
+                        f"{existing_buy.price/100:.2f} (ask now present)."
+                    )
+                    self._cancel_order(existing_buy)
+                    del self._my_standing_orders[market_id][OrderSide.BUY.name]
+                    if not self._my_standing_orders.get(market_id):
+                        self._my_standing_orders.pop(market_id, None)
+                
+            if self._pending_order:
+                continue
+            
             if bid is None:
                 existing_sell = self._my_standing_orders.get(market_id, {}).get(OrderSide.SELL.name)
                 if existing_sell is not None:
@@ -700,6 +717,19 @@ class CAPMBot(Agent):
 
                 if self._try_trade(market, OrderSide.SELL, sell_price, current_performance):
                     return
+                
+            else:
+                # Bid exists but not profitable, cancel any stale SELL standing order
+                existing_sell = self._my_standing_orders.get(market_id, {}).get(OrderSide.SELL.name)
+                if existing_sell is not None:
+                    self.inform(
+                        f"[ACTIVE] Cancelling stale SELL in {market.name} at "
+                        f"{existing_sell.price/100:.2f} (bid now present)."
+                    )
+                    self._cancel_order(existing_sell)
+                    del self._my_standing_orders[market_id][OrderSide.SELL.name]
+                    if not self._my_standing_orders.get(market_id):
+                        self._my_standing_orders.pop(market_id, None)
 
     def _try_trade(self, market: Market, side: OrderSide, price: int, 
                    current_performance: float, reactive: bool = False) -> bool:
